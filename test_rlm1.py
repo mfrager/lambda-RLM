@@ -2,11 +2,16 @@
 
 import os
 from rlm import LambdaRLM
+from dotenv import load_dotenv
+
+load_dotenv()
 
 with open("plato.txt") as f:
     document = f.read()
 
 print("Document length: " + str(len(document)))
+
+MODEL = "lmstudio_z/gemma-4-e4b-it"
 
 prompt = f"""Context:
 {document}
@@ -17,9 +22,9 @@ Answer:"""
 
 rlm = LambdaRLM(
     backend_kwargs={
-        "model_name": "",
-        "api_key": "",
-        "base_url": "",
+        "model_name": MODEL,
+        "api_key": os.environ['OPENAI_API_KEY'],
+        "base_url": os.environ['OPENAI_BASE_URL'],
     },
     context_window_tokens=30_000,
     verbose=True,
