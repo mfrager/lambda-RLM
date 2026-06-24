@@ -11,7 +11,8 @@ with open("plato.txt") as f:
 
 print("Document length: " + str(len(document)))
 
-MODEL = "lmstudio_z/gemma-4-e4b-it"
+#MODEL = "lmstudio_z/gemma-4-e4b-it"
+MODEL = "auto/local_z"
 
 prompt = f"""Context:
 {document}
@@ -26,9 +27,10 @@ rlm = LambdaRLM(
         "api_key": os.environ['OPENAI_API_KEY'],
         "base_url": os.environ['OPENAI_BASE_URL'],
     },
-    context_window_tokens=30_000,
+    context_window_tokens=10_000,
     verbose=True,
 )
 
 result = rlm.completion(prompt)
 print(result.response)
+
