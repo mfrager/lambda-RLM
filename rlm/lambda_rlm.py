@@ -41,7 +41,7 @@ from collections import Counter
 sys.setrecursionlimit(5000)
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, List, Tuple
 
 from rlm.clients import BaseLM, get_client
 from rlm.core.lm_handler import LMHandler
@@ -49,6 +49,8 @@ from rlm.core.types import ClientBackend, EnvironmentType, RLMChatCompletion
 from rlm.environments.local_repl import LocalREPL
 from rlm.logger import RLMLogger
 
+# Token estimation
+from rlm.token_utils import TokenChunker, count_tokens
 
 # ─── Task types ───────────────────────────────────────────────────────────────
 
@@ -166,10 +168,10 @@ class LambdaPlan:
     compose_op:    ComposeOp
     pipeline:      PipelineFlags
     k_star:        int    # optimal branching factor k*
-    tau_star:      int    # leaf chunk size τ* (chars)
+    tau_star:      int    # leaf chunk size τ* (tokens)
     depth:         int    # recursion depth d = ⌈log_k*(n/K)⌉
     cost_estimate: float  # Ĉ: relative cost estimate
-    n:             int    # total input length (chars)
+    n:             int    # total input length (tokens)
 
 
 # ─── LambdaRLM ────────────────────────────────────────────────────────────────
@@ -188,7 +190,7 @@ class LambdaRLM:
         backend_kwargs:        Backend kwargs, e.g. {"model_name": "gpt-4o"}.
         environment:           REPL env type; only "local" is used by λ-RLM.
         environment_kwargs:    Extra kwargs forwarded to LocalREPL.
-        context_window_chars:  Model context window in chars (default 400k ≈ 100k tokens).
+        context_window_tokens: Model context window in tokens.
         accuracy_target:       Minimum accuracy α for the accuracy constraint (0–1).
         a_leaf:                Estimated single-call accuracy A(K) (default 0.95).
         a_compose:             Estimated per-level composition accuracy A_⊕ (default 0.90).
@@ -203,7 +205,7 @@ class LambdaRLM:
         backend_kwargs: dict[str, Any] | None = None,
         environment: EnvironmentType = "local",
         environment_kwargs: dict[str, Any] | None = None,
-        context_window_chars: int = 100_000,
+        context_window_tokens: int = 100_000,
         accuracy_target: float = 0.80,
         a_leaf: float = 0.95,
         a_compose: float = 0.90,
@@ -215,13 +217,14 @@ class LambdaRLM:
         self.backend_kwargs = backend_kwargs or {}
         self.environment_type = environment
         self.environment_kwargs = environment_kwargs or {}
-        self.context_window_chars = context_window_chars
+        self.context_window_tokens = context_window_tokens
         self.accuracy_target = accuracy_target
         self.a_leaf = a_leaf
         self.a_compose = a_compose
         self.query = query
         self.verbose = verbose
         self.logger = logger
+        self.main_stdout = sys.stdout
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -279,9 +282,11 @@ class LambdaRLM:
 
             try:
                 # ── Phase 2: Task Detection (1 LLM call) ─────────────────────
-                repl.execute_code("lrlm_peek = context_0[:500]\nlrlm_n = len(context_0)")
+                #repl.execute_code("lrlm_peek = context_0[:500]\nlrlm_n = len(context_0)")
+                repl.execute_code("lrlm_peek = context_0[:500]")
                 peek_text = str(repl.locals.get("lrlm_peek", context_text[:500]))
-                n = int(repl.locals.get("lrlm_n", len(context_text)))
+                #n = int(repl.locals.get("lrlm_n", len(context_text)))
+                n = count_tokens(context_text)
 
                 metadata = (
                     f"length={n}, "
@@ -294,7 +299,7 @@ class LambdaRLM:
                 task_type = self._parse_task_type(raw)
 
                 if self.verbose:
-                    print(f"[λ-RLM] n={n:,} chars  |  task={task_type.value}  |  q={effective_query[:60]!r}")
+                    print(f"[λ-RLM] n={n:,} tokens  |  task={task_type.value}  |  q={effective_query[:60]!r}")
 
                 # ── Phase 3: Optimal Planning (0 LLM calls, pure math) ────────
                 plan = self._plan(task_type, n)
@@ -309,6 +314,10 @@ class LambdaRLM:
                 # ── Phase 5: Execute Combinator Chain Φ in REPL ──────────────
                 self._register_library(repl, plan, effective_query)
                 phi_code = self._build_phi_code(plan, effective_query)
+
+                #if self.verbose:
+                #    print(f"[λ-RLM] phi_code=\n{phi_code}\n")
+
                 phi_result = repl.execute_code(phi_code)
 
                 if phi_result.stderr:
@@ -356,7 +365,7 @@ class LambdaRLM:
         τ* = min(K, ⌊n/k*⌋)
         Ĉ  = k*^d · C(τ*) + d · C_⊕(k*) + C(500)  [probe cost]
         """
-        K = self.context_window_chars
+        K = self.context_window_tokens
         compose_op = COMPOSITION_TABLE[task_type]
         pipeline   = PLAN_TABLE[task_type]
         c_compose  = C_COMPOSE[compose_op]
@@ -396,7 +405,8 @@ class LambdaRLM:
             d = max(1, math.ceil(math.log(n / K) / math.log(k_star)))
 
         # τ* = min(K, ⌊n/k*⌋)
-        tau_star = min(K, max(1, n // k_star))
+        #tau_star = min(K, max(1, n // k_star))
+        tau_star = min(K, max(1, int(K * .75)))
 
         # Ĉ = k*^d · C(τ*) + d · C_⊕(k*) + C(500)
         cost_estimate = (
@@ -436,29 +446,33 @@ class LambdaRLM:
             return text[start: start + length]
 
         # ── Split(P, k) → [P₁, ..., P_k]  (word-boundary aware) ─────────────
-        def _split(text: str, k: int) -> list[str]:
-            if k <= 1:
-                return [text]
-            n = len(text)
-            chunk_size = max(1, n // k)
-            chunks: list[str] = []
-            start = 0
-            for i in range(k):
-                if start >= n:
-                    break
-                if i == k - 1:
-                    chunks.append(text[start:])
-                    break
-                end = start + chunk_size
-                # Snap to nearest word boundary within ±20% of chunk_size.
-                if end < n:
-                    margin = max(1, chunk_size // 5)
-                    boundary = text.rfind(" ", max(start, end - margin), min(n, end + margin))
-                    if boundary > start:
-                        end = boundary + 1
-                chunks.append(text[start:end])
-                start = end
-            return [c for c in chunks if c]
+        def _split(text: str, k: int, tau: int) -> list[str]:
+            chunks = TokenChunker(model="gpt-4o").chunk(text, max_tokens=tau, max_chunks=k)
+            for i in range(len(chunks)):
+                print(f"Chunk[{plan.depth}.{i}]: {count_tokens(chunks[i])}", file=self.main_stdout)
+            return chunks
+#            if k <= 1:
+#                return [text]
+#            n = len(text)
+#            chunk_size = max(1, n // k)
+#            chunks: list[str] = []
+#            start = 0
+#            for i in range(k):
+#                if start >= n:
+#                    break
+#                if i == k - 1:
+#                    chunks.append(text[start:])
+#                    break
+#                end = start + chunk_size
+#                # Snap to nearest word boundary within ±20% of chunk_size.
+#                if end < n:
+#                    margin = max(1, chunk_size // 5)
+#                    boundary = text.rfind(" ", max(start, end - margin), min(n, end + margin))
+#                    if boundary > start:
+#                        end = boundary + 1
+#                chunks.append(text[start:end])
+#                start = end
+#            return [c for c in chunks if c]
 
         # ── Reduce(⊕, [R₁…R_k']) ─────────────────────────────────────────────
         # Direct reference to _llm_query avoids an extra dict lookup.
@@ -557,6 +571,7 @@ class LambdaRLM:
         repl.globals["_Peek"]           = _peek
         repl.globals["_Reduce"]         = _reduce
         repl.globals["_FilterRelevant"] = _filter_relevant
+        repl.globals["_Tokens"]         = count_tokens
 
     # ── Internal: Phase 5b — BuildExecutor + execute ─────────────────────────
 
@@ -584,6 +599,7 @@ class LambdaRLM:
         k    = plan.k_star
         peek_len = max(50, tau // 10)
         template = TASK_TEMPLATES[plan.task_type]
+        leaf_max = int(self.context_window_tokens * .75)
 
         # Leaf call: sub_M(Template[τ_type].Fmt(P)) — the ONLY neural call in Φ.
         if plan.task_type == TaskType.QA and query:
@@ -600,6 +616,7 @@ class LambdaRLM:
         # Split + optional filter (inside the else branch of _Phi).
         # Indented 8 spaces = inside `else:` block of `def _Phi(P):`.
         if plan.pipeline.use_filter and query:
+            raise Exception("Not implemented...")
             split_block = (
                 f"        _raw = _Split(P, {k})\n"
                 f"        _pairs = [(_raw[i], _Peek(_raw[i], 0, {peek_len}))"
@@ -607,12 +624,12 @@ class LambdaRLM:
                 f"        _chunks = _FilterRelevant({repr(query)}, _pairs)\n"
             )
         else:
-            split_block = f"        _chunks = _Split(P, {k})\n"
+            split_block = f"        _chunks = _Split(P, {k}, {tau})\n"
 
         # Full Φ code.  lambda_rlm_result (no _ prefix) is saved to repl.locals.
         return (
             f"def _Phi(P):\n"
-            f"    if len(P) <= {tau}:\n"
+            f"    if _Tokens(P) <= {leaf_max}:\n"
             f"        return {leaf_expr}\n"
             f"    else:\n"
             f"{split_block}"

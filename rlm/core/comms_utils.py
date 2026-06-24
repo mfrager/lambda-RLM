@@ -244,6 +244,8 @@ def send_lm_request_batched(
         List of LMResponse objects, one per prompt, in the same order.
     """
     try:
+        #print(f"LLM Prompts:\n{prompts}\n")
+      
         request = LMRequest(prompts=prompts, model=model, depth=depth)
         response_data = socket_request(address, request.to_dict(), timeout)
         response = LMResponse.from_dict(response_data)
@@ -254,6 +256,8 @@ def send_lm_request_batched(
 
         if response.chat_completions is None:
             return [LMResponse.error_response("No completions returned")] * len(prompts)
+
+        #print(f"LLM Responses:\n{response.chat_completions}\n")
 
         # Convert batched response to list of individual responses
         return [

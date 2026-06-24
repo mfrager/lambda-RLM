@@ -251,11 +251,14 @@ class LocalREPL(NonIsolatedEnv):
             return "Error: No LM handler configured"
 
         try:
+            print(f"LLM Query:\n{prompt[:200]}", file=self._main_stdout)
             request = LMRequest(prompt=prompt, model=model, depth=self.depth)
             response = send_lm_request(self.lm_handler_address, request)
 
             if not response.success:
                 return f"Error: {response.error}"
+
+            #print(f"LLM Response:\n{response.chat_completion.response}\n", file=self._main_stdout)
 
             self._pending_llm_calls.append(response.chat_completion)
             return response.chat_completion.response
@@ -485,6 +488,9 @@ class LocalREPL(NonIsolatedEnv):
 
         # Clear pending LLM calls from previous execution
         self._pending_llm_calls = []
+
+        self._main_stdout = sys.stdout
+        print(f"Execute Code:\n{code}")
 
         with self._capture_output() as (stdout_buf, stderr_buf), self._temp_cwd():
             try:
